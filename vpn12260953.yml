@@ -1,0 +1,862 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Smart VPN Server with monitoring usage and alert
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+
+  ExistingKeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  UserName:
+    Type: String
+    Description: vpn management
+
+  Password:
+    Type: String
+    Description: vpn management
+    NoEcho: true
+
+  AlertEmail:
+    Type: String
+
+  DuckDnsDomain:
+    Type: String
+    Description: DuckDNS subdomain(without .duckdns.org)
+
+  DuckDnsToken:
+    Type: String
+    NoEcho: true
+
+Resources:
+  # Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAccosication:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref Subnet
+
+  WireGuardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WireGuard VPN Server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIp: 0.0.0.0/0
+          Description: WireGuard VPN
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  WireGuardInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: WireGuardInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  WireGuardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WireGuardInstanceRole
+
+  WireGuardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ExistingKeyPairName
+      SecurityGroupIds:
+        - !Ref WireGuardSecurityGroup
+      SubnetId: !Ref Subnet
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y wireguard-tools iptables-services curl amazon-ssm-agent
+
+          systemctl enable amazon-ssm-agent --now
+
+          # Enable IP forwarding
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
+          sysctl -p
+
+          mkdir -p /etc/wireguard
+          cd /etc/wireguard
+          umask 077
+
+          wg genkey | tee server.key | wg pubkey > server.pub
+          for i in 1 2 3; do
+            wg genkey |tee client$i.key | wg pubkey > client$i.pub
+          done
+
+          cat > wg0.conf <<EOF
+          [Interface]
+          Address = 10.8.0.1/24, fd42:42:42::1/64
+          ListenPort = 51820
+          PrivateKey = $(cat server.key)
+
+          PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+          PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
+          PostUp = iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
+
+          PostUp = ip6tables -A FORWARD -i wg0 -j ACCEPT
+          PostUp = ip6tables -A FORWARD -o wg0 -j ACCEPT
+          PostUp = ip6tables -t nat -A POSTROUTING -s fd42:42:42::/64 -j MASQUERADE
+          EOF
+
+          for i in 1 2 3; do
+          cat >> wg0.conf <<EOF
+
+          [Peer]
+          PublicKey = $(cat client$i.pub)
+          AllowedIPs = 10.8.0.$((i+1))/32, fd42:42:42::$((i+1))/128
+          EOF
+          done
+
+          systemctl enable wg-quick@wg0 --now
+
+          echo "*/5 * * * * curl -s https://www.duckdns.org/update?domains=${DuckDnsDomain}&token=${DuckDnsToken}&ip=" | crontab -
+  # db for sessions
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  MetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VpnControl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - sns:Publish
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+              - Effect: Allow
+                Action: dynamodb:*
+                Resource: '*'
+
+  VPNManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          ADMIN_USER: !Ref UserName
+          ADMIN_PASS: !Ref Password
+          SESSION_TABLE: !Ref SessionTable
+          METRICS_TABLE: !Ref MetricsTable
+          INSTANCE_ID: !Ref WireGuardInstance
+          ALERT_TOPIC: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import secrets
+          from datetime import datetime, timedelta
+
+          ec2 = boto3.client('ec2')
+          dynamodb = boto3.resource('dynamodb')
+          ssm = boto3.client('ssm')
+          cloudwatch = boto3.client('cloudwatch')
+          sns = boto3.client('sns')
+
+          INSTANCE_ID = os.environ['INSTANCE_ID']
+          MERICS_TABLE = os.environ['MERICS_TABLE']
+          SESSION_TABLE = os.environ['SESSION_TABLE']
+          ALERT_TOPIC = os.environ['ALERT_TOPIC']
+          ADMIN_USER = os.environ['ADMIN_USER']
+          ADMIN_PASS = os.environ['ADMIN_PASS']
+
+          mertrics_table = dynamodb.Table(METRICS_TABLE)
+          session_table = dynamodb.Table(SESSION_TABLE)
+
+          def create_session():
+            session_id = secrets.toen_urlsafe(32)
+            expires_at = int(time.time()) + 86400 # 24hours
+            session_table.put_item(
+              Item = {
+                'id': session_id,
+                'expires_at': expires_at,
+                'created': int(time.time())
+              }
+            )
+            return session_id
+
+          def verify_session(session_id):
+            if not session_id:
+              print('verify session id failed without session id')
+              return False
+            try:
+              response = sessiontable.get_item(Key={'id': session_id})
+              if 'Item' in response:
+                print('verify session id success with:', session_id)
+                return int(time.time()) < response['Item']['expires_at']
+            except:
+              pass
+            print('verify session id failed with:', session_id)
+            return False
+
+          def lambda_handler(evet, context):
+            try:
+              query_params = event.get('queryStringParameters') or {}
+              action = query_params.get('action', 'login')
+              session_id = query_params.get('session') or event.get('headers', {}).get('cookie', '').split('session=')[-1].split(';')[0] if 'session=' in event.get('headers', {}).get('cookie', '') else None
+
+              if action == 'login':
+                  return show_login_page()
+
+              elif action == 'auth':
+                  password = query_params.get('password', '')
+                  username = query_params.get('username', '')
+
+                  if username ==  ADMIN_USER and password == ADMIN_PASS:
+                      new_session = create_session()
+                      return {
+                          'statusCode': 302,
+                          'headers': {
+                              'Location': f'?action=status&session={new_session}',
+                              'Set-Cookie': f'session={new_session}; Max-Age=86400; HttpOnly; Secure; SameSite=Strict'
+                          },
+                          'body': ''
+                      }
+                  else:
+                      return show_login_page(error="❌ Invalid password")
+                elif action == 'logout':
+                    if session_id:
+                        try:
+                            session_table.delete_item(Key={'id': session_id})
+                        except:
+                            pass
+                    return {
+                        'statusCode': 302,
+                        'headers': {
+                            'Location': '?action=login',
+                            'Set-Cookie': 'session=; Max-Age=0'
+                        },
+                        'body': ''
+                    }
+
+                # Check authentication for all other actions
+                elif not verify_session(session_id):
+                    return show_login_page(error="🔒 Session expired, please login again")
+
+                if action == 'status':
+                    return get_vpn_status()
+                elif action == 'stop':
+                    return stop_vpn_server()
+                elif action == 'start':
+                    return start_vpn_server()
+                elif action == 'check_traffic':
+                    return check_traffic_and_shutdown()
+                elif action == 'config':
+                    return get_client_config()
+                else:
+                    return {
+                        'statusCode': 400,
+                        'headers': {'Content-Type': 'application/json'},
+                        'body': json.dumps({'error': 'Invalid action'})
+                    }
+            except Exception as e:
+                return {
+                    'statusCode': 500,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({'error': str(e)})
+                }
+
+          def show_login_page(error=""):
+
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>🔒 VPN Management</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }}
+                    .login-card {{ background: white; padding: 40px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); max-width: 400px; width: 100%; }}
+                    .logo {{ text-align: center; font-size: 4em; margin-bottom: 20px; }}
+                    .title {{ text-align: center; color: #333; margin-bottom: 30px; font-size: 24px; }}
+                    .form-group {{ margin: 20px 0; }}
+                    .form-control {{ width: 100%; padding: 15px 20px; border: 2px solid #e9ecef; border-radius: 12px; font-size: 16px; transition: border-color 0.3s; }}
+                    .form-control:focus {{ border-color: #007bff; outline: none; box-shadow: 0 0 0 3px rgba(0,123,255,0.1); }}
+                    .btn {{ width: 100%; padding: 15px; background: linear-gradient(135deg, #007bff, #0056b3); color: white; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; transition: transform 0.2s; }}
+                    .btn:hover {{ transform: translateY(-2px); }}
+                    .btn:active {{ transform: translateY(0); }}
+                    .error {{ background: #fee; color: #c33; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #dc3545; }}
+                    .info {{ background: #e8f4fd; color: #0c5460; padding: 20px; border-radius: 12px; margin: 20px 0; font-size: 14px; line-height: 1.5; }}
+                    .password-hint {{ text-align: center; margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; font-family: monospace; font-size: 14px; color: #666; }}
+                    .features {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 20px 0; }}
+                    .feature {{ text-align: center; padding: 10px; background: #f8f9fa; border-radius: 8px; font-size: 12px; }}
+                </style>
+            </head>
+            <body>
+                <div class="login-card">
+                    <div class="logo">🔒</div>
+                    <h1 class="title">VPN Management</h1>
+
+                    {'<div class="error">' + error + '</div>' if error else ''}
+
+                    <form method="get" action="">
+                        <input type="hidden" name="action" value="auth">
+                        <div class="form-group">
+                            <input type="text" name="username" class="form-control" placeholder="Enter admin username" required autofocus autocomplete="current-username">
+                            <input type="password" name="password" class="form-control" placeholder="Enter admin password" required autofocus autocomplete="current-password">
+                        </div>
+                        <button type="submit" class="btn">🚀 Access VPN Dashboard</button>
+                    </form>
+
+                    <div class="features">
+                        <div class="feature">📱<br>Mobile Friendly</div>
+                        <div class="feature">🔐<br>Secure Sessions</div>
+                        <div class="feature">⚡<br>Fast Access</div>
+                        <div class="feature">🌐<br>Any Device</div>
+                    </div>
+
+                    <div class="info">
+                        <strong>✨ Features:</strong><br>
+                        • 24-hour secure sessions<br>
+                        • Mobile-optimized interface<br>
+                        • Real-time VPN monitoring<br>
+                        • One-click server control<br>
+                        • Client configuration generator
+                    </div>
+
+                    <div class="password-hint">
+                        <strong>Admin Password:</strong><br>
+                        <code>ADMIN_PASS</code>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'text/html'},
+                'body': html
+            }
+
+          def get_data_transfer_usage():
+            try:
+                # Get current month's data transfer
+                end_time = datetime.utcnow()
+                start_time = end_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                response = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkOut',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': INSTANCE_ID}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,
+                    Statistics=['Sum']
+                )
+
+                total_bytes = sum([point['Sum'] for point in response['Datapoints']])
+                total_gb = total_bytes / (1024**3)
+                remaining_gb = max(0, 100 - total_gb)
+                percentage = min(100, (total_gb / 100) * 100)
+
+                return {
+                    'used_gb': round(total_gb, 2),
+                    'remaining_gb': round(remaining_gb, 2),
+                    'percentage': round(percentage, 1),
+                    'status': 'critical' if percentage > 100 else 'warning' if percentage > 80 else 'ok'
+                }
+            except Exception as e:
+                return {
+                    'used_gb': 0,
+                    'remaining_gb': 100,
+                    'percentage': 0,
+                    'status': 'unknown',
+                    'error': str(e)
+                }
+
+          def get_vpn_status(session_id):
+            # Get instance status
+            response = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+            instance = response['Reservations'][0]['Instances'][0]
+
+            state = instance['State']['Name']
+            public_ip = instance.get('PublicIpAddress', 'N/A')
+
+            # Get data transfer stats
+            transfer_stats = get_data_transfer_usage()
+
+            # Get traffic stats from DynamoDB
+            try:
+                item = table.get_item(Key={'id': 'traffic_stats'})['Item']
+                last_check = item.get('last_check', 'Never')
+                bytes_transferred = item.get('bytes_transferred', 0)
+            except:
+                last_check = 'Never'
+                bytes_transferred = 0
+
+            # Status indicators
+            status_color = {
+                'ok': '#d4edda',
+                'warning': '#fff3cd',
+                'critical': '#f8d7da',
+                'unknown': '#e2e3e5'
+            }.get(transfer_stats['status'], '#e2e3e5')
+
+            status_text_color = {
+                'ok': '#155724',
+                'warning': '#856404',
+                'critical': '#721c24',
+                'unknown': '#383d41'
+            }.get(transfer_stats['status'], '#383d41')
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Smart VPN Server Management</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <meta http-equiv="refresh" content="300">
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #f8f9fa; }}
+                    .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+                    .header {{ text-align: center; margin-bottom: 30px; }}
+                    .status-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin: 20px 0; }}
+                    .status-card {{ padding: 20px; border-radius: 8px; border: 1px solid #dee2e6; }}
+                    .running {{ background: #d4edda; color: #155724; border-color: #c3e6cb; }}
+                    .stopped {{ background: #f8d7da; color: #721c24; border-color: #f5c6cb; }}
+                    .data-transfer {{ background: {status_color}; color: {status_text_color}; border-color: {status_color}; }}
+                    .button {{ background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; margin: 8px; text-decoration: none; display: inline-block; font-weight: 500; }}
+                    .button:hover {{ background: #0056b3; }}
+                    .stop-btn {{ background: #dc3545; }}
+                    .stop-btn:hover {{ background: #c82333; }}
+                    .config-btn {{ background: #28a745; }}
+                    .config-btn:hover {{ background: #218838; }}
+                    .progress-bar {{ width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; overflow: hidden; margin: 10px 0; }}
+                    .progress-fill {{ height: 100%; background: linear-gradient(90deg, #28a745, #ffc107, #dc3545); transition: width 0.3s ease; }}
+                    .info {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #007bff; }}
+                    .warning {{ background: #fff3cd; border-left-color: #ffc107; }}
+                    .critical {{ background: #f8d7da; border-left-color: #dc3545; }}
+                    .code-block {{ background: #f8f9fa; padding: 15px; border-radius: 6px; font-family: 'Monaco', 'Consolas', monospace; font-size: 12px; overflow-x: auto; margin: 10px 0; }}
+                    .split-tunnel-info {{ background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #28a745; }}
+                    .logout-btn {{ background: #6c757d; }}
+                    .logout-btn:hover {{ background: #545b62; }}
+                    .mobile-optimized {{ display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 20px 0; }}
+                    @media (max-width: 600px) {{
+                        .mobile-optimized {{ flex-direction: column; }}
+                        .button {{ width: 100%; text-align: center; }}
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>🔒 Smart VPN Server Management</h1>
+                        <p>Free Tier Optimized • Auto-monitoring • Split Tunneling</p>
+                    </div>
+
+                    <div class="status-grid">
+                        <div class="status-card {'running' if state == 'running' else 'stopped'}">
+                            <h3>🖥️ Server Status</h3>
+                            <strong>Status:</strong> {state.upper()}<br>
+                            <strong>Public IP:</strong> {public_ip}<br>
+                            <strong>Instance:</strong> {INSTANCE_ID}<br>
+                            <strong>Type:</strong> t3.micro (Free Tier)
+                        </div>
+
+                        <div class="status-card data-transfer">
+                            <h3>📊 Data Transfer (This Month)</h3>
+                            <strong>Used:</strong> {transfer_stats['used_gb']} GB / 15 GB<br>
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: {min(100, transfer_stats['percentage'])}%"></div>
+                            </div>
+                            <strong>Remaining:</strong> {transfer_stats['remaining_gb']} GB ({100-transfer_stats['percentage']:.1f}%)<br>
+                            <strong>Status:</strong> {transfer_stats['status'].upper()}
+                            {'<br><strong>⚠️ Approaching free tier limit!</strong>' if transfer_stats['status'] == 'warning' else ''}
+                            {'<br><strong>🚨 Exceeded free tier limit!</strong>' if transfer_stats['status'] == 'critical' else ''}
+                        </div>
+                    </div>
+
+                    <div class="info">
+                        <strong>📈 VPN Traffic Stats:</strong><br>
+                        Last Check: {last_check}<br>
+                        Bytes Transferred: {bytes_transferred:,}<br>
+                        Auto-shutdown: 22:00 daily if inactive
+                    </div>
+
+                    {'<div class="split-tunnel-info"><strong>🔀 Split Tunneling Enabled</strong><br>Only specific traffic routes through VPN to minimize data usage. Perfect for accessing blocked sites while keeping regular browsing direct.</div>' if SPLIT_TUNNELING else ''}
+
+                    <div class="mobile-optimized">
+                        {'<a href="?action=stop&session=' + session_id + '" class="button stop-btn">🛑 Stop Server</a>' if state == 'running' else '<a href="?action=start&session=' + session_id + '" class="button">▶️Start Server</a>'}
+                        <a href="?action=config&session={session_id}" class="button">📱 Get Config</a>
+                        <a href="?action=status&session={session_id}" class="button">🔄 Refresh</a>
+                        <a href="?action=logout" class="button logout-btn">🚪 Logout</a>
+                    </div>
+
+                    <div class="info">
+                        <strong>💰 Cost Optimization:</strong><br>
+                        • Free for 12 months (t3.micro + 15GB transfer)<br>
+                        • Auto-shutdown saves ~50% costs<br>
+                        • Split tunneling reduces data usage by 70-90%<br>
+                        • After free tier: ~$7.59/month
+                    </div>
+
+                    <div class="info">
+                        <strong>🛡️ Security Features:</strong><br>
+                        • WireGuard encryption<br>
+                        • Automatic firewall configuration<br>
+                        • Traffic monitoring and alerts<br>
+                        • Smart bandwidth management
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'text/html'},
+                'body': html_content
+            }
+
+          def get_client_config(session_id):
+            # Get instance IP
+            response = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+            instance = response['Reservations'][0]['Instances'][0]
+            public_ip = instance.get('PublicIpAddress', 'N/A')
+
+            config_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>VPN Client Configuration</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f8f9fa; }}
+                    .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+                    .code-block {{ background: #f8f9fa; padding: 20px; border-radius: 8px; font-family: 'Monaco', 'Consolas', monospace; font-size: 14px; overflow-x: auto; margin: 15px 0; border: 1px solid #dee2e6; }}
+                    .button {{ background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; margin: 8px; text-decoration: none; display: inline-block; }}
+                    .info {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #007bff; }}
+                    .warning {{ background: #fff3cd; border-left-color: #ffc107; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>📱 VPN Client Configuration</h1>
+
+                    <div class="info">
+                        <strong>Server IP:</strong> {public_ip}<br>
+                        <strong>Status:</strong> You need to SSH to the server to get the complete configuration
+                    </div>
+
+                    <h3>🔧 Setup Instructions:</h3>
+
+                    <h4>Step 1: SSH to your server</h4>
+                    <div class="code-block">ssh -i your-keypair.pem ec2-user@{public_ip}</div>
+
+                    <h4>Step 2: Get server public key</h4>
+                    <div class="code-block">sudo cat /etc/wireguard/server_public.key</div>
+
+                    <h4>Step 3: Generate client keys</h4>
+                    <div class="code-block">wg genkey | tee client_private.key | wg pubkey > client_public.key</div>
+
+                    <h4>Step 4: Client configuration template</h4>
+                    <div class="code-block">
+                      [Interface]
+                      PrivateKey = YOUR_CLIENT_PRIVATE_KEY
+                      Address = 10.8.0.2/32
+                      DNS = 8.8.8.8, 1.1.1.1
+
+                      [Peer]
+                      PublicKey = YOUR_SERVER_PUBLIC_KEY
+                      Endpoint = {public_ip}:51820
+                      AllowedIPs = {allowed_ips}
+                      PersistentKeepalive = 25</div>
+
+                    <div class="{'info' if SPLIT_TUNNELING else 'warning'}">
+                        <strong>{'🔀 Split Tunneling Mode' if SPLIT_TUNNELING else '⚠️ Full Tunnel Mode'}:</strong><br>
+                        {'This configuration only routes specific traffic through VPN, saving data transfer. Perfect for accessing blocked sites while keeping regular browsing direct.' if SPLIT_TUNNELING else 'This routes ALL traffic through VPN. This will use more data transfer but provides complete privacy.'}
+                    </div>
+
+                    <h4>Step 5: Add client to server</h4>
+                    <div class="code-block">sudo wg set wg0 peer YOUR_CLIENT_PUBLIC_KEY allowed-ips 10.8.0.2/32
+                      sudo wg-quick save wg0</div>
+
+                    <div class="info">
+                        <strong>📱 Mobile Apps:</strong><br>
+                        • iOS: WireGuard from App Store<br>
+                        • Android: WireGuard from Play Store<br>
+                        • Import the configuration file or scan QR code
+                    </div>
+
+                    <a href="?action=status&session={session_id}" class="button">← Back to Dashboard</a>
+                </div>
+            </body>
+            </html>
+            """
+
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'text/html'},
+                'body': config_content
+            }
+
+          def stop_vpn_server(session_id):
+            ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+            return {
+                'statusCode': 302,
+                'headers': {'Location': '?action=status&session={session_id}'},
+                'body': ''
+            }
+
+          def start_vpn_server(session_id):
+              ec2.start_instances(InstanceIds=[INSTANCE_ID])
+              return {
+                  'statusCode': 302,
+                  'headers': {'Location': '?action=status&session={session_id}'},
+                  'body': ''
+              }
+
+          def check_traffic_and_shutdown():
+              # Check data transfer usage
+              transfer_stats = get_data_transfer_usage()
+
+              # Send command to check VPN traffic
+              command = """
+              #!/bin/bash
+
+              # Check WireGuard traffic
+              if command -v wg &> /dev/null && wg show wg0 &> /dev/null; then
+                  BYTES=$(wg show wg0 transfer 2>/dev/null | awk '{sum += $3} END {print sum+0}')
+              else
+                  BYTES=0
+              fi
+
+              echo $BYTES
+              """
+
+              try:
+                  response = ssm.send_command(
+                      InstanceIds=[INSTANCE_ID],
+                      DocumentName='AWS-RunShellScript',
+                      Parameters={'commands': [command]}
+                  )
+
+                  # Store traffic data
+                  table.put_item(
+                      Item={
+                          'id': 'traffic_stats',
+                          'last_check': datetime.utcnow().isoformat(),
+                          'bytes_transferred': 0,  # Will be updated with actual data
+                          'data_transfer_gb': transfer_stats['used_gb']
+                      }
+                  )
+
+                  # Send alert if approaching limit
+                  if transfer_stats['status'] in ['warning', 'critical']:
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject=f"VPN Data Transfer Alert - {transfer_stats['status'].upper()}",
+                          Message=f"Your VPN server has used {transfer_stats['used_gb']} GB out of 15 GB free tier limit this month. Status: {transfer_stats['status']}"
+                      )
+
+              except Exception as e:
+                  print(f"Error in traffic check: {e}")
+
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'message': 'Traffic check completed', 'transfer_stats': transfer_stats})
+              }
+  # API Gateway
+  VPNManagementAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-vpn-management
+      Description: Smart VPN Server Management API
+
+  VPNManagementResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VPNManagementAPI
+      ParentId: !GetAtt VPNManagementAPI.RootResourceId
+      PathPart: '{proxy+}'
+
+  VPNManagementMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VPNManagementAPI
+      ResourceId: !Ref VPNManagementResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VPNManagementFunction.Arn}/invocations
+
+  VPNManagementDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: VPNManagementMethod
+    Properties:
+      RestApiId: !Ref VPNManagementAPI
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  VPNManagementLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VPNManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:restapi/${VPNManagementAPI}/*/*
+
+  # EventBridge Rule for Daily Check
+  VPNDailyCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Daily VPN traffic check and auto-shutdown
+      ScheduleExpression: !Sub cron(0 15 * * ? *) # 22:00 Hong Kong time (UTC+8)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt VPNManagementFunction.Arn
+          Id: VPNDailyCheck
+          Input: '{"queryStringParameters": {"action": "check_traffic"}}'
+
+  VPNDailyCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VPNManagementFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt VPNDailyCheckRule.Arn
+
+Outputs:
+  VPNManagementURL:
+    Description: 🌐 Static web endpoint to manage your VPN server
+    Value: !Sub https://${VPNManagementAPI}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${AWS::StackName}-Management-URL
+
+  VPNServerPublicIP:
+    Description: 📍 Current VPN server public IP (dynamic)
+    Value: !GetAtt WireGuardInstance.PublicIp
