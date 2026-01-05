@@ -139,9 +139,29 @@ Resources:
       SubnetId: !Ref Subnet
       UserData: !Base64
         Fn::Sub: |
+          Content-Type: multipart/mixed; boundary="//"
+          MIME-Version: 1.0
+            
+          --//
+          Content-Type: text/x-shellscript-per-boot; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="per-boot.txt"
+
           #!/bin/bash
+          date >> boot-history
+          curl -s "https://www.duckdns.org/update?domains=${DuckDnsDomain}&token=${DuckDnsToken}&ip="
+            
+          --//
+          Content-Type: text/x-shellscript; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="userdata.txt"
+
+          #!/bin/bash
+
           dnf update -y
-          dnf install -y wireguard-tools iptables-services curl amazon-ssm-agent
+          dnf install -y --skip-broken wireguard-tools iptables-services curl amazon-ssm-agent
 
           systemctl enable amazon-ssm-agent --now
 
@@ -185,7 +205,8 @@ Resources:
 
           systemctl enable wg-quick@wg0 --now
 
-          echo "*/5 * * * * curl -s https://www.duckdns.org/update?domains=${DuckDnsDomain}&token=${DuckDnsToken}&ip=" | crontab -
+          curl -s "https://www.duckdns.org/update?domains=${DuckDnsDomain}&token=${DuckDnsToken}&ip="
+          --//--         
   # db for sessions
   SessionTable:
     Type: AWS::DynamoDB::Table
@@ -275,6 +296,7 @@ Resources:
           import os
           import secrets
           from datetime import datetime, timedelta
+          import time
 
           ec2 = boto3.client('ec2')
           dynamodb = boto3.resource('dynamodb')
@@ -283,21 +305,22 @@ Resources:
           sns = boto3.client('sns')
 
           INSTANCE_ID = os.environ['INSTANCE_ID']
-          MERICS_TABLE = os.environ['MERICS_TABLE']
+          METRICS_TABLE = os.environ['METRICS_TABLE']
           SESSION_TABLE = os.environ['SESSION_TABLE']
           ALERT_TOPIC = os.environ['ALERT_TOPIC']
           ADMIN_USER = os.environ['ADMIN_USER']
           ADMIN_PASS = os.environ['ADMIN_PASS']
+          SPLIT_TUNNELING = False
 
           mertrics_table = dynamodb.Table(METRICS_TABLE)
           session_table = dynamodb.Table(SESSION_TABLE)
 
           def create_session():
-            session_id = secrets.toen_urlsafe(32)
+            session_id = secrets.token_urlsafe(32)
             expires_at = int(time.time()) + 86400 # 24hours
             session_table.put_item(
               Item = {
-                'id': session_id,
+                'session_id': session_id,
                 'expires_at': expires_at,
                 'created': int(time.time())
               }
@@ -309,20 +332,22 @@ Resources:
               print('verify session id failed without session id')
               return False
             try:
-              response = sessiontable.get_item(Key={'id': session_id})
+              response = session_table.get_item(Key={'session_id': session_id})
               if 'Item' in response:
                 print('verify session id success with:', session_id)
                 return int(time.time()) < response['Item']['expires_at']
-            except:
-              pass
+            except Exception as e:
+              print(str(e))
+              print('verify session id failed with:', session_id)
             print('verify session id failed with:', session_id)
             return False
 
-          def lambda_handler(evet, context):
+          def handler(event, context):
             try:
               query_params = event.get('queryStringParameters') or {}
               action = query_params.get('action', 'login')
-              session_id = query_params.get('session') or event.get('headers', {}).get('cookie', '').split('session=')[-1].split(';')[0] if 'session=' in event.get('headers', {}).get('cookie', '') else None
+              session_id = query_params.get('session') or \
+                (event.get('headers', {}).get('cookie', '').split('session=')[-1].split(';')[0] if event.get('headers') != None and 'session=' in event.get('headers', {}).get('cookie', '') else None)
 
               if action == 'login':
                   return show_login_page()
@@ -343,41 +368,41 @@ Resources:
                       }
                   else:
                       return show_login_page(error="❌ Invalid password")
-                elif action == 'logout':
-                    if session_id:
-                        try:
-                            session_table.delete_item(Key={'id': session_id})
-                        except:
-                            pass
-                    return {
-                        'statusCode': 302,
-                        'headers': {
-                            'Location': '?action=login',
-                            'Set-Cookie': 'session=; Max-Age=0'
-                        },
-                        'body': ''
-                    }
+              elif action == 'logout':
+                  if session_id:
+                      try:
+                          session_table.delete_item(Key={'id': session_id})
+                      except:
+                          pass
+                  return {
+                      'statusCode': 302,
+                      'headers': {
+                          'Location': '?action=login',
+                          'Set-Cookie': 'session=; Max-Age=0'
+                      },
+                      'body': ''
+                  }
 
-                # Check authentication for all other actions
-                elif not verify_session(session_id):
-                    return show_login_page(error="🔒 Session expired, please login again")
+              # Check authentication for all other actions
+              elif not verify_session(session_id):
+                  return show_login_page(error="🔒 Session expired, please login again")
 
-                if action == 'status':
-                    return get_vpn_status()
-                elif action == 'stop':
-                    return stop_vpn_server()
-                elif action == 'start':
-                    return start_vpn_server()
-                elif action == 'check_traffic':
-                    return check_traffic_and_shutdown()
-                elif action == 'config':
-                    return get_client_config()
-                else:
-                    return {
-                        'statusCode': 400,
-                        'headers': {'Content-Type': 'application/json'},
-                        'body': json.dumps({'error': 'Invalid action'})
-                    }
+              if action == 'status':
+                  return get_vpn_status(session_id)
+              elif action == 'stop':
+                  return stop_vpn_server(session_id)
+              elif action == 'start':
+                  return start_vpn_server(session_id)
+              elif action == 'check_traffic':
+                  return check_traffic_and_shutdown()
+              elif action == 'config':
+                  return get_client_config(session_id)
+              else:
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Invalid action'})
+                  }
             except Exception as e:
                 return {
                     'statusCode': 500,
@@ -393,6 +418,7 @@ Resources:
             <head>
                 <title>🔒 VPN Management</title>
                 <meta name="viewport" content="width=device-width, initial-scale=1">
+                <meta charset="UTF-8">
                 <style>
                     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
                     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }}
@@ -464,6 +490,7 @@ Resources:
                 # Get current month's data transfer
                 end_time = datetime.utcnow()
                 start_time = end_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                start_time = datetime(2025, 12, 1)
 
                 response = cloudwatch.get_metric_statistics(
                     Namespace='AWS/EC2',
@@ -537,6 +564,7 @@ Resources:
                 <title>Smart VPN Server Management</title>
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <meta http-equiv="refresh" content="300">
+                <meta charset="UTF-8">
                 <style>
                     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #f8f9fa; }}
                     .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
@@ -586,7 +614,7 @@ Resources:
 
                         <div class="status-card data-transfer">
                             <h3>📊 Data Transfer (This Month)</h3>
-                            <strong>Used:</strong> {transfer_stats['used_gb']} GB / 15 GB<br>
+                            <strong>Used:</strong> {transfer_stats['used_gb']} GB / 100 GB<br>
                             <div class="progress-bar">
                                 <div class="progress-fill" style="width: {min(100, transfer_stats['percentage'])}%"></div>
                             </div>
@@ -640,92 +668,18 @@ Resources:
             }
 
           def get_client_config(session_id):
-            # Get instance IP
-            response = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-            instance = response['Reservations'][0]['Instances'][0]
-            public_ip = instance.get('PublicIpAddress', 'N/A')
-
-            config_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>VPN Client Configuration</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f8f9fa; }}
-                    .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
-                    .code-block {{ background: #f8f9fa; padding: 20px; border-radius: 8px; font-family: 'Monaco', 'Consolas', monospace; font-size: 14px; overflow-x: auto; margin: 15px 0; border: 1px solid #dee2e6; }}
-                    .button {{ background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; margin: 8px; text-decoration: none; display: inline-block; }}
-                    .info {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #007bff; }}
-                    .warning {{ background: #fff3cd; border-left-color: #ffc107; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>📱 VPN Client Configuration</h1>
-
-                    <div class="info">
-                        <strong>Server IP:</strong> {public_ip}<br>
-                        <strong>Status:</strong> You need to SSH to the server to get the complete configuration
-                    </div>
-
-                    <h3>🔧 Setup Instructions:</h3>
-
-                    <h4>Step 1: SSH to your server</h4>
-                    <div class="code-block">ssh -i your-keypair.pem ec2-user@{public_ip}</div>
-
-                    <h4>Step 2: Get server public key</h4>
-                    <div class="code-block">sudo cat /etc/wireguard/server_public.key</div>
-
-                    <h4>Step 3: Generate client keys</h4>
-                    <div class="code-block">wg genkey | tee client_private.key | wg pubkey > client_public.key</div>
-
-                    <h4>Step 4: Client configuration template</h4>
-                    <div class="code-block">
-                      [Interface]
-                      PrivateKey = YOUR_CLIENT_PRIVATE_KEY
-                      Address = 10.8.0.2/32
-                      DNS = 8.8.8.8, 1.1.1.1
-
-                      [Peer]
-                      PublicKey = YOUR_SERVER_PUBLIC_KEY
-                      Endpoint = {public_ip}:51820
-                      AllowedIPs = {allowed_ips}
-                      PersistentKeepalive = 25</div>
-
-                    <div class="{'info' if SPLIT_TUNNELING else 'warning'}">
-                        <strong>{'🔀 Split Tunneling Mode' if SPLIT_TUNNELING else '⚠️ Full Tunnel Mode'}:</strong><br>
-                        {'This configuration only routes specific traffic through VPN, saving data transfer. Perfect for accessing blocked sites while keeping regular browsing direct.' if SPLIT_TUNNELING else 'This routes ALL traffic through VPN. This will use more data transfer but provides complete privacy.'}
-                    </div>
-
-                    <h4>Step 5: Add client to server</h4>
-                    <div class="code-block">sudo wg set wg0 peer YOUR_CLIENT_PUBLIC_KEY allowed-ips 10.8.0.2/32
-                      sudo wg-quick save wg0</div>
-
-                    <div class="info">
-                        <strong>📱 Mobile Apps:</strong><br>
-                        • iOS: WireGuard from App Store<br>
-                        • Android: WireGuard from Play Store<br>
-                        • Import the configuration file or scan QR code
-                    </div>
-
-                    <a href="?action=status&session={session_id}" class="button">← Back to Dashboard</a>
-                </div>
-            </body>
-            </html>
-            """
 
             return {
                 'statusCode': 200,
                 'headers': {'Content-Type': 'text/html'},
-                'body': config_content
+                'body': 'Not Implemented Yet'
             }
 
           def stop_vpn_server(session_id):
             ec2.stop_instances(InstanceIds=[INSTANCE_ID])
             return {
                 'statusCode': 302,
-                'headers': {'Location': '?action=status&session={session_id}'},
+                'headers': {'Location': f'?action=status&session={session_id}'},
                 'body': ''
             }
 
@@ -733,7 +687,7 @@ Resources:
               ec2.start_instances(InstanceIds=[INSTANCE_ID])
               return {
                   'statusCode': 302,
-                  'headers': {'Location': '?action=status&session={session_id}'},
+                  'headers': {'Location': f'?action=status&session={session_id}'},
                   'body': ''
               }
 
@@ -801,6 +755,18 @@ Resources:
       RestApiId: !Ref VPNManagementAPI
       ParentId: !GetAtt VPNManagementAPI.RootResourceId
       PathPart: '{proxy+}'
+    
+  VPNManagementMethodRoot:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VPNManagementAPI
+      ResourceId: !GetAtt VPNManagementAPI.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VPNManagementFunction.Arn}/invocations
 
   VPNManagementMethod:
     Type: AWS::ApiGateway::Method
@@ -816,7 +782,9 @@ Resources:
 
   VPNManagementDeployment:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: VPNManagementMethod
+    DependsOn: 
+      - VPNManagementMethodRoot
+      - VPNManagementMethod
     Properties:
       RestApiId: !Ref VPNManagementAPI
       StageName: prod
@@ -828,7 +796,7 @@ Resources:
       FunctionName: !Ref VPNManagementFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:restapi/${VPNManagementAPI}/*/*
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VPNManagementAPI}/*
 
   # EventBridge Rule for Daily Check
   VPNDailyCheckRule:
