@@ -384,7 +384,7 @@ Resources:
                   }
 
               # Check authentication for all other actions
-              elif not verify_session(session_id):
+              elif not verify_session(session_id) and action != 'check_traffic':
                   return show_login_page(error="🔒 Session expired, please login again")
 
               if action == 'status':
