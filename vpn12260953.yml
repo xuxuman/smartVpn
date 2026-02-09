@@ -303,6 +303,16 @@ Resources:
           import secrets
           from datetime import datetime, timedelta
           import time
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
 
           ec2 = boto3.client('ec2')
           dynamodb = boto3.resource('dynamodb')
@@ -331,21 +341,22 @@ Resources:
                 'created': int(time.time())
               }
             )
+            logger.info('created new session: %s', session_id)
             return session_id
 
           def verify_session(session_id):
             if not session_id:
-              print('verify session id failed without session id')
+              logger.warning('verify session id failed without session id')
               return False
             try:
               response = session_table.get_item(Key={'session_id': session_id})
               if 'Item' in response:
-                print('verify session id success with:', session_id)
+                logger.info('verify session id success with: %s', session_id)
                 return int(time.time()) < response['Item']['expires_at']
             except Exception as e:
-              print(str(e))
-              print('verify session id failed with:', session_id)
-            print('verify session id failed with:', session_id)
+              logger.exception('Exception while verifying session id')
+              logger.warning('verify session id failed with: %s', session_id)
+            logger.warning('verify session id failed with: %s', session_id)
             return False
 
           def handler(event, context):
@@ -354,6 +365,10 @@ Resources:
               action = query_params.get('action', 'login')
               session_id = query_params.get('session') or \
                 (event.get('headers', {}).get('cookie', '').split('session=')[-1].split(';')[0] if event.get('headers') != None and 'session=' in event.get('headers', {}).get('cookie', '') else None)
+
+              logger.info('context:%s', context)
+              request_id = getattr(context, 'aws_request_id', None)
+              logger.info('handler invoked action=%s session=%s request_id=%s', action, session_id, request_id)
 
               if action == 'login':
                   return show_login_page()
@@ -364,6 +379,7 @@ Resources:
 
                   if username ==  ADMIN_USER and password == ADMIN_PASS:
                       new_session = create_session()
+                      logger.info('auth success user=%s session=%s', username, new_session)
                       return {
                           'statusCode': 302,
                           'headers': {
@@ -373,13 +389,15 @@ Resources:
                           'body': ''
                       }
                   else:
-                      return show_login_page(error="❌ Invalid password")
+                    logger.warning('auth failed for user=%s', username)
+                    return show_login_page(error="❌ Invalid password")
               elif action == 'logout':
+                  logger.info('logout requested session=%s', session_id)
                   if session_id:
                       try:
                           session_table.delete_item(Key={'id': session_id})
                       except:
-                          pass
+                        logger.exception('failed to delete session %s', session_id)
                   return {
                       'statusCode': 302,
                       'headers': {
@@ -389,19 +407,24 @@ Resources:
                       'body': ''
                   }
 
-              # Check authentication for all other actions
+                # Check authentication for all other actions
               elif not verify_session(session_id) and action != 'check_traffic':
                   return show_login_page(error="🔒 Session expired, please login again")
 
               if action == 'status':
+                  logger.info('action=status session=%s', session_id)
                   return get_vpn_status(session_id)
               elif action == 'stop':
+                  logger.info('action=stop session=%s', session_id)
                   return stop_vpn_server(session_id)
               elif action == 'start':
+                  logger.info('action=start session=%s', session_id)
                   return start_vpn_server(session_id)
               elif action == 'check_traffic':
+                  logger.info('action=check_traffic')
                   return check_traffic_and_shutdown()
               elif action == 'config':
+                  logger.info('action=config session=%s', session_id)
                   return get_client_config(session_id)
               else:
                   return {
@@ -410,10 +433,11 @@ Resources:
                       'body': json.dumps({'error': 'Invalid action'})
                   }
             except Exception as e:
+                logger.exception('Unhandled exception in handler')
                 return {
-                    'statusCode': 500,
-                    'headers': {'Content-Type': 'application/json'},
-                    'body': json.dumps({'error': str(e)})
+                  'statusCode': 500,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': str(e)})
                 }
 
           def show_login_page(error=""):
@@ -741,7 +765,7 @@ Resources:
                       )
 
               except Exception as e:
-                  print(f"Error in traffic check: {e}")
+                  logger.exception(f"Error in traffic check: {e}")
 
               return {
                   'statusCode': 200,
