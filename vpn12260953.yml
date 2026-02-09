@@ -121,6 +121,11 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
 
   WireGuardInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -134,6 +139,7 @@ Resources:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
       InstanceType: !Ref InstanceType
       KeyName: !Ref ExistingKeyPairName
+      IamInstanceProfile: !Ref WireGuardInstanceProfile
       SecurityGroupIds:
         - !Ref WireGuardSecurityGroup
       SubnetId: !Ref Subnet
